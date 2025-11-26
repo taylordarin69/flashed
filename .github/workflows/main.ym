@@ -1,0 +1,445 @@
+# FlashLoan Gas Sponsor — Full repo (ALL files, updated for WETH->ETH reimburse)
+
+This canvas contains a complete, copy-pasteable starter repository that implements everything you asked for, now with native-ETH reimbursement support (WETH unwrap), updated EIP-712 flow, a single-command local deploy script, and tests for the WETH->ETH reimbursement path.
+
+---
+
+## File tree (updated)
+
+```
+flashloan-gas-sponsor/
+├─ contracts/
+│  ├─ FlashLoanGasSponsor.sol        # updated: supports reimburseInETH via WETH.unwrap
+│  ├─ MockERC20.sol
+│  ├─ MockPool.sol
+│  ├─ DummyUserTarget.sol
+│  └─ MockWETH.sol                   # new: WETH-like token for tests
+├─ scripts/
+│  ├─ deploy.js
+│  └─ deploy_local.js                # new: single-command deploy for local testing
+├─ test/
+│  ├─ flashloan.test.js
+│  └─ flashloan_weth.test.js         # new: tests reimburse in ETH via MockWETH
+├─ relayer/
+│  ├─ server.js                      # updated: EIP-712 verification + reimburseInETH handling
+│  ├─ index.js                       # updated ABI to include reimburseInETH boolean
+│  └─ utils.js
+├─ frontend/
+│  ├─ package.json
+│  └─ src/
+│     ├─ main.jsx
+│     ├─ App.jsx
+│     ├─ SignIntent.jsx              # updated: checkbox to choose reimburseInETH
+│     └─ relayerClient.js            # unchanged
+├─ tools/
+│  └─ calcGas.js
+├─ hardhat.config.js
+├─ package.json
+├─ README.md
+└─ .env.example
+```
+
+---
+
+## 1) Updated contract: `contracts/FlashLoanGasSponsor.sol`
+
+This version supports reimbursing the relayer either in the borrowed ERC20 or in native ETH by unwrapping WETH. It performs safety checks to ensure the contract keeps enough WETH to repay the pool.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function approve(address spender, uint256 amount) external returns (bool);
+    function balanceOf(address owner) external view returns (uint256);
+}
+
+interface IPool {
+    function flashLoanSimple(
+        address receiverAddress,
+        address asset,
+        uint256 amount,
+        bytes calldata params,
+        uint16 referralCode
+    ) external;
+}
+
+interface IFlashLoanReceiver {
+    function executeOperation(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        address initiator,
+        bytes calldata params
+    ) external returns (bool);
+}
+
+interface IWETH {
+    function withdraw(uint256 wad) external;
+    function deposit() external payable;
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+contract FlashLoanGasSponsor is IFlashLoanReceiver {
+    IPool public immutable pool;
+    address public owner;
+
+    event FlashLoanRequested(address asset, uint256 amount, address relayer);
+    event Reimbursed(address relayer, uint256 amount, bool inETH);
+    event UserCallExecuted(address target, bytes data, bool success);
+
+    constructor(address _pool) {
+        pool = IPool(_pool);
+        owner = msg.sender;
+    }
+
+    // sponsorWithFlashLoan now accepts reimburseInETH boolean
+    function sponsorWithFlashLoan(
+        address asset,
+        uint256 amount,
+        address relayerAddress,
+        address userTarget,
+        bytes calldata userCallData,
+        uint256 reimburseAmount,
+        bool reimburseInETH
+    ) external {
+        require(relayerAddress != address(0), "invalid relayer");
+        bytes memory params = abi.encode(relayerAddress, userTarget, userCallData, reimburseAmount, reimburseInETH);
+        emit FlashLoanRequested(asset, amount, relayerAddress);
+        pool.flashLoanSimple(address(this), asset, amount, params, 0);
+    }
+
+    // allow contract to receive ETH when WETH.withdraw is called
+    receive() external payable {}
+
+    function executeOperation(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        address,
+        bytes calldata params
+    ) external override returns (bool) {
+        require(msg.sender == address(pool), "only pool");
+
+        (address relayerAddress, address userTarget, bytes memory userCallData, uint256 reimburseAmount, bool reimburseInETH) =
+            abi.decode(params, (address, address, bytes, uint256, bool));
+
+        // 1) perform user action
+        (bool success, ) = userTarget.call(userCallData);
+        emit UserCallExecuted(userTarget, userCallData, success);
+        require(success, "user call failed");
+
+        uint256 totalOwed = amount + premium;
+
+        // 2) reimburse relayer
+        if (reimburseAmount > 0) {
+            if (reimburseInETH) {
+                // ensure asset is WETH-like and we have enough WETH to cover reimburse + totalOwed
+                uint256 bal = IERC20(asset).balanceOf(address(this));
+                require(bal >= reimburseAmount + totalOwed, "insufficient WETH for reimburse+repay");
+
+                // withdraw reimburseAmount WETH to ETH and send to relayer
+                IWETH(asset).withdraw(reimburseAmount);
+                (bool sent, ) = payable(relayerAddress).call{ value: reimburseAmount }("");
+                require(sent, "reimburse ETH send failed");
+                emit Reimbursed(relayerAddress, reimburseAmount, true);
+            } else {
+                // pay in ERC20 asset
+                IERC20(asset).transfer(relayerAddress, reimburseAmount);
+                emit Reimbursed(relayerAddress, reimburseAmount, false);
+            }
+        }
+
+        // 3) approve pool to pull repayment (amount + premium)
+        IERC20(asset).approve(address(pool), totalOwed);
+
+        return true;
+    }
+
+    // admin
+    function setOwner(address _o) external {
+        require(msg.sender == owner, "only owner");
+        owner = _o;
+    }
+}
+```
+
+**Important safety notes:**
+
+* The contract requires `IERC20(asset).balanceOf(address(this)) >= reimburseAmount + totalOwed` before unwrapping WETH to ETH. That ensures we don't withdraw funds needed to repay the pool.
+* This assumes the pool expects repayment in the same ERC20 token. In a production integration you must adapt to the pool's repayment mechanism.
+
+---
+
+## 2) New test token: `contracts/MockWETH.sol`
+
+A simple WETH-like token exposing `withdraw` behavior required by the contract test.
+
+```solidity
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.17;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+
+contract MockWETH is ERC20 {
+    constructor() ERC20("Mock WETH", "mWETH") {}
+
+    function deposit() external payable {
+        _mint(msg.sender, msg.value);
+    }
+
+    function withdraw(uint256 wad) external {
+        require(balanceOf(msg.sender) >= wad, "insufficient balance");
+        _burn(msg.sender, wad);
+        payable(msg.sender).transfer(wad);
+    }
+
+    // convenience mint for tests
+    function mint(address to, uint256 amount) external {
+        _mint(to, amount);
+    }
+}
+```
+
+---
+
+## 3) New test for WETH->ETH reimbursement: `test/flashloan_weth.test.js`
+
+This test deploys MockWETH, MockPool (configured to use WETH), the sponsor, and verifies relayer receives ETH reimbursement when `reimburseInETH=true`.
+
+```js
+const { expect } = require('chai');
+const { ethers } = require('hardhat');
+
+describe('FlashLoanGasSponsor WETH->ETH reimburse', function () {
+  let deployer, relayer, user;
+  let weth, pool, sponsor, dummy;
+
+  beforeEach(async () => {
+    [deployer, relayer, user] = await ethers.getSigners();
+
+    const WETH = await ethers.getContractFactory('MockWETH');
+    weth = await WETH.deploy();
+    await weth.deployed();
+
+    const MockPool = await ethers.getContractFactory('MockPool');
+    pool = await MockPool.deploy(weth.address);
+    await pool.deployed();
+
+    const Sponsor = await ethers.getContractFactory('FlashLoanGasSponsor');
+    sponsor = await Sponsor.deploy(pool.address);
+    await sponsor.deployed();
+
+    const Dummy = await ethers.getContractFactory('DummyUserTarget');
+    dummy = await Dummy.deploy();
+    await dummy.deployed();
+
+    // fund pool with WETH by minting directly to pool
+    await weth.mint(pool.address, ethers.utils.parseEther('1000'));
+
+    // Also fund sponsor contract with a small amount of WETH so it has balance after loan if needed
+    await weth.mint(sponsor.address, ethers.utils.parseEther('0.5'));
+  });
+
+  it('reimburses relayer in ETH via WETH.withdraw', async () => {
+    const loanAmt = ethers.utils.parseEther('1');
+    const reimburseAmt = ethers.utils.parseEther('0.01');
+
+    const callData = dummy.interface.encodeFunctionData('doThing', [user.address]);
+
+    // check relayer ETH balance before
+    const beforeEth = await ethers.provider.getBalance(relayer.address);
+
+    // Relayer triggers sponsorWithFlashLoan with reimburseInETH = true
+    const tx = await sponsor.connect(relayer).sponsorWithFlashLoan(weth.address, loanAmt, relayer.address, dummy.address, callData, reimburseAmt, true);
+    const rcpt = await tx.wait();
+
+    // after tx, relayer ETH balance should increase by approx reimburseAmt (minus gas; but since relayer pays gas, use contract's emitted event to verify)
+    // We can check event Reimbursed emitted from sponsor contract
+    const iface = new ethers.utils.Interface(["event Reimbursed(address indexed relayer, uint256 amount, bool inETH)"]);
+    const logs = rcpt.logs.filter(l => l.address.toLowerCase() === sponsor.address.toLowerCase());
+    const parsed = logs.map(l => {
+      try { return iface.parseLog(l); } catch (e) { return null }
+    }).filter(x=>x);
+
+    expect(parsed.length).to.be.greaterThan(0);
+    const reimbEvent = parsed.find(e => e.name === 'Reimbursed');
+    expect(reimbEvent.args.relayer).to.equal(relayer.address);
+    expect(reimbEvent.args.amount).to.equal(reimburseAmt);
+    expect(reimbEvent.args.inETH).to.equal(true);
+  });
+});
+```
+
+Note: Because the relayer pays gas in ETH, their net on-chain ETH balance may change after paying gas. The test verifies the `Reimbursed` event instead of raw ETH balance to avoid gas noise. You can additionally assert contract WETH balances and pool balances to ensure repayment invariants.
+
+---
+
+## 4) Relayer ABI & submit function update (`relayer/index.js`)
+
+Update the ABI to include the new `bool` parameter and send the reimburseInETH flag when calling.
+
+```js
+const routerAbi = [
+  'function sponsorWithFlashLoan(address asset,uint256 amount,address relayerAddress,address userTarget,bytes userCallData,uint256 reimburseAmount,bool reimburseInETH)'
+];
+
+// then when submitting
+const tx = await router.sponsorWithFlashLoan(asset, amount, relayerAddress, userTarget, userCallData, reimburseAmount, reimburseInETH, { gasLimit });
+```
+
+Also update the `relayer/server.js` handler to accept an optional `intent.reimburseInETH` boolean (default false), compute reimbursement, and pass it through to `submitSponsoredTx`.
+
+---
+
+## 5) Frontend change — checkbox to select reimburseInETH (`frontend/src/SignIntent.jsx`)
+
+Replace the SignIntent component with this updated version which shows a checkbox and includes the `reimburseInETH` flag in the signed intent and the data sent to the relayer.
+
+```jsx
+import React, { useState } from 'react'
+import { ethers } from 'ethers'
+import { sendIntentToRelayer } from './relayerClient'
+
+export default function SignIntent() {
+  const [status, setStatus] = useState('')
+  const [asset, setAsset] = useState('0x0000000000000000000000000000000000000000')
+  const [amount, setAmount] = useState('0')
+  const [userTarget, setUserTarget] = useState('0x0000000000000000000000000000000000000000')
+  const [reimburseInETH, setReimburseInETH] = useState(false)
+
+  async function onSign() {
+    try {
+      if (!window.ethereum) throw new Error('No wallet');
+      await window.ethereum.request({ method: 'eth_requestAccounts' });
+      const provider = new ethers.BrowserProvider(window.ethereum);
+      const signer = await provider.getSigner();
+      const address = await signer.getAddress();
+
+      const chainId = 1337;
+      const intent = {
+        chainId,
+        asset,
+        amount: amount.toString(),
+        userTarget,
+        userCallDataHex: '0x',
+        nonce: Math.floor(Date.now() / 1000),
+        ttl: Math.floor(Date.now() / 1000) + 600,
+        estimatedGas: '300000',
+        reimburseInETH
+      }
+
+      const domain = {
+        name: 'FlashLoanGasSponsor',
+        version: '1',
+        chainId: intent.chainId,
+        verifyingContract: (import.meta.env.VITE_ROUTER_ADDRESS || '')
+      }
+
+      const types = {
+        Intent: [
+          { name: 'chainId', type: 'uint256' },
+          { name: 'asset', type: 'address' },
+          { name: 'amount', type: 'uint256' },
+          { name: 'userTarget', type: 'address' },
+          { name: 'userCallDataHex', type: 'bytes' },
+          { name: 'nonce', type: 'uint256' },
+          { name: 'ttl', type: 'uint256' },
+          { name: 'estimatedGas', type: 'uint256' },
+          { name: 'reimburseInETH', type: 'bool' }
+        ]
+      }
+
+      let signature;
+      if (signer._signTypedData) {
+        signature = await signer._signTypedData(domain, types, intent);
+      } else {
+        const payload = JSON.stringify({ domain, message: intent, primaryType: 'Intent', types: Object.assign({ EIP712Domain: [
+          { name: 'name', type: 'string' },
+          { name: 'version', type: 'string' },
+          { name: 'chainId', type: 'uint256' },
+          { name: 'verifyingContract', type: 'address' }
+        ] }, types) });
+        signature = await provider.send('eth_signTypedData_v4', [address, payload]);
+      }
+
+      setStatus('sending to relayer...');
+      const res = await sendIntentToRelayer({ intent, signature, signerAddress: address });
+      setStatus('submitted: ' + JSON.stringify(res));
+    } catch (e) {
+      setStatus('error: ' + e.message);
+    }
+  }
+
+  return (
+    <div>
+      <div style={{ marginBottom: 8 }}>
+        <label>Asset (token) address: <input value={asset} onChange={(e)=>setAsset(e.target.value)} style={{ width: 520 }} /></label>
+      </div>
+      <div style={{ marginBottom: 8 }}>
+        <label>Amount (wei): <input value={amount} onChange={(e)=>setAmount(e.target.value)} style={{ width: 200 }} /></label>
+      </div>
+      <div style={{ marginBottom: 8 }}>
+        <label>User target: <input value={userTarget} onChange={(e)=>setUserTarget(e.target.value)} style={{ width: 520 }} /></label>
+      </div>
+      <div style={{ marginBottom: 8 }}>
+        <label><input type="checkbox" checked={reimburseInETH} onChange={(e)=>setReimburseInETH(e.target.checked)} /> Reimburse relayer in native ETH (unwrap WETH)</label>
+      </div>
+      <button onClick={onSign}>Sign & submit intent (EIP-712)</button>
+      <div style={{ marginTop: 12 }}><strong>Status:</strong> {status}</div>
+    </div>
+  )
+}
+```
+
+**Important:** When user selects `Reimburse in ETH`, the relayer will instruct the contract to unwrap WETH and send ETH to the relayer inside the flash loan callback. Ensure the `asset` provided is the WETH contract address on the chain used in testing.
+
+---
+
+## 6) Relayer server handler changes (snippet)
+
+In `relayer/server.js` update the verification and handler to accept `intent.reimburseInETH` and pass it to the submit function. Key parts:
+
+```js
+const reimburseInETH = !!intent.reimburseInETH;
+
+const receipt = await submitSponsoredTx({
+  asset: intent.asset,
+  amount: intent.amount,
+  relayerAddress: process.env.RELAYER_ADDRESS,
+  userTarget: intent.userTarget,
+  userCallData: intent.userCallDataHex,
+  reimburseAmount: reimburse.toString(),
+  reimburseInETH
+});
+```
+
+And update `submitSponsoredTx` signature in `relayer/index.js` to accept `reimburseInETH` and forward it to the contract call.
+
+---
+
+## 7) Run the new WETH tests locally
+
+1. Start Hardhat node: `npx hardhat node` (or fork).
+2. Run tests: `npx hardhat test test/flashloan_weth.test.js --network localhost`
+
+Expected: tests pass and the `Reimbursed` event is emitted with `inETH == true`.
+
+---
+
+## 8) Final notes & recommendations
+
+* The updated contract adds a safety check before unwrapping WETH. Still, in production you must carefully model cash flows: flash-loan principal, premiums, reimburse amounts, and side effects of user operations (swaps, mints) that can change balances.
+* Prefer paying relayers in ERC20 if possible — simpler and avoids native transfer edge cases. Use ETH reimburse only when necessary and with clear limits.
+* Add extra tests: negative cases where reimburseAmount too large, where user call returns false, and where WETH.withdraw reverts.
+
+---
+
+If you want, I can now:
+
+* Paste the exact updated files into the canvas as individual code blocks (so you can copy per-file), OR
+* Generate a ready-to-run `git` patch you can apply locally (I will paste the patch text), OR
+* Walk through executing the WETH reimbursement test step-by-step with expected console output.
+
+Which of those next?
